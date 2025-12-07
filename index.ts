@@ -4,6 +4,7 @@
  * Runtime: Bun v1.0+
  * Description: High-performance OpenAI-compatible API Gateway for StockAI
  * Features: Fake IP, Env Config, Stream/Non-stream, Robust Error Handling
+ * Updated: Added missing models from client source
  * =================================================================================
  */
 
@@ -33,16 +34,27 @@ const UPSTREAM = {
     "sec-fetch-site": "same-origin",
     "priority": "u=1, i"
   },
+  // Full list extracted from client source (MemoizedMarkdown/eE array)
   MODELS: [
     "openai/gpt-4o-mini",
-    "google/gemini-2.0-flash",
     "stockai/news",
+    "arcee-ai/trinity-mini",
+    "deepcogito/cogito-v2.1-671b",
     "deepseek/deepseek-chat-v3.1",
-    "meta/llama-4-scout",
-    "moonshotai/kimi-k2",
+    "google/gemini-2.0-flash",
+    "google/gemini-3-pro",
+    "google/gemini-3-pro-backup",
+    "z-ai/glm-4.5-air",
     "z-ai/glm-4.6",
+    "moonshotai/kimi-k2",
+    "moonshotai/kimi-k2-thinking",
+    "meta/llama-4-scout",
+    "meituan/longcat-flash-chat",
+    "meituan/longcat-flash-chat-search",
     "mistral/mistral-small",
-    "qwen/qwen3-coder"
+    "openai/gpt-oss-20b",
+    "qwen/qwen3-coder",
+    "alibaba/tongyi-deepresearch-30b-a3b"
   ],
   DEFAULT_MODEL: "openai/gpt-4o-mini"
 };
@@ -122,7 +134,7 @@ Bun.serve({
 });
 
 console.log(`🚀 StockAI-2API running on port ${PORT}`);
-console.log(`🔑 Key: ${API_MASTER_KEY}`);
+console.log(`✨ Loaded ${UPSTREAM.MODELS.length} models`);
 
 // --- Handlers ---
 
@@ -152,16 +164,13 @@ async function handleChatCompletions(req) {
   const messages = body.messages || [];
 
   // --- FIX: Sanitize Messages & Prevent "substring" errors ---
-  // Ensure we only process valid messages and content is always string
   const validMessages = messages
     .filter(m => m && m.role)
     .map(msg => {
-        // Handle array content (multimodal) or null/undefined
         let contentStr = "";
         if (typeof msg.content === 'string') {
             contentStr = msg.content;
         } else if (Array.isArray(msg.content)) {
-            // Simple fallback for multimodal: join text parts
             contentStr = msg.content
                 .filter(p => p.type === 'text')
                 .map(p => p.text)
@@ -210,7 +219,6 @@ async function handleChatCompletions(req) {
     const encoder = new TextEncoder();
     const decoder = new TextDecoder();
     
-    // Create a ReadableStream using Bun's native stream support logic
     const customStream = new ReadableStream({
         async start(controller) {
             const reader = upstreamRes.body.getReader();
@@ -247,7 +255,6 @@ async function handleChatCompletions(req) {
                     }
                 }
                 
-                // Finish
                 const endChunk = {
                     id: requestId,
                     object: "chat.completion.chunk",
@@ -273,7 +280,7 @@ async function handleChatCompletions(req) {
     });
   }
 
-  // --- Non-Stream Handler (Buffering) ---
+  // --- Non-Stream Handler ---
   else {
     const reader = upstreamRes.body.getReader();
     const decoder = new TextDecoder();
