@@ -3,21 +3,20 @@
  * Project: stockai-2api-bun
  * Runtime: Bun v1.0+
  * Description: High-performance OpenAI-compatible API Gateway for StockAI
- * Features: Fake IP, Env Config, Stream/Non-stream, Robust Error Handling
- * Updated: Added missing models from client source
+ * Features: Fake IP, Env Config, Stream/Non-stream, DeepSeek/Thinking Support
+ * Updated: Precision Parsing for 'reasoning-delta'
  * =================================================================================
  */
 
 // Load environment variables
 const PORT = process.env.PORT || 3000;
-const API_MASTER_KEY = process.env.API_KEY || "sk-stockai-free"; // Default key if not set
-const TIMEOUT_MS = 60000; // 60s timeout
+const API_MASTER_KEY = process.env.API_KEY || "sk-stockai-free";
+const TIMEOUT_MS = 300000; // 5 minutes for thinking models
 
 // Upstream Configuration
 const UPSTREAM = {
   ORIGIN: "https://free.stockai.trade",
   API_URL: "https://free.stockai.trade/api/chat",
-  // Base headers mimicking Chrome 142
   BASE_HEADERS: {
     "authority": "free.stockai.trade",
     "accept": "*/*",
@@ -34,7 +33,6 @@ const UPSTREAM = {
     "sec-fetch-site": "same-origin",
     "priority": "u=1, i"
   },
-  // Full list extracted from client source (MemoizedMarkdown/eE array)
   MODELS: [
     "openai/gpt-4o-mini",
     "stockai/news",
@@ -59,13 +57,12 @@ const UPSTREAM = {
   DEFAULT_MODEL: "openai/gpt-4o-mini"
 };
 
-// --- Helper: Random IP Generator ---
+// --- Helpers ---
 function generateRandomIP() {
   const r = () => Math.floor(Math.random() * 255);
   return `${r()}.${r()}.${r()}.${r()}`;
 }
 
-// --- Helper: Generate Headers with Fake IP ---
 function getUpstreamHeaders() {
   const fakeIp = generateRandomIP();
   return {
@@ -76,7 +73,6 @@ function getUpstreamHeaders() {
   };
 }
 
-// --- Helper: ID Generator ---
 function generateRandomId(length = 16) {
   const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
   let result = '';
@@ -84,7 +80,6 @@ function generateRandomId(length = 16) {
   return result;
 }
 
-// --- Helper: CORS ---
 const CORS_HEADERS = {
   'Access-Control-Allow-Origin': '*',
   'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
@@ -97,14 +92,11 @@ Bun.serve({
   async fetch(req) {
     const url = new URL(req.url);
 
-    // 1. CORS Preflight
     if (req.method === 'OPTIONS') {
       return new Response(null, { headers: CORS_HEADERS });
     }
 
-    // 2. Authentication
     const authHeader = req.headers.get('Authorization');
-    // Allow if MASTER_KEY is "1" (debug) or matches Bearer token
     if (API_MASTER_KEY !== "1" && authHeader !== `Bearer ${API_MASTER_KEY}`) {
       return new Response(JSON.stringify({ error: { message: "Unauthorized", code: 401 } }), { 
         status: 401, 
@@ -112,16 +104,9 @@ Bun.serve({
       });
     }
 
-    // 3. Routing
     try {
-      if (url.pathname === '/v1/models') {
-        return handleModels();
-      }
-      if (url.pathname === '/v1/chat/completions' && req.method === 'POST') {
-        return await handleChatCompletions(req);
-      }
-      
-      // 404 for others
+      if (url.pathname === '/v1/models') return handleModels();
+      if (url.pathname === '/v1/chat/completions' && req.method === 'POST') return await handleChatCompletions(req);
       return new Response(JSON.stringify({ error: "Not Found" }), { status: 404, headers: CORS_HEADERS });
     } catch (e) {
       console.error(`[Server Error] ${e.message}`);
@@ -134,7 +119,7 @@ Bun.serve({
 });
 
 console.log(`🚀 StockAI-2API running on port ${PORT}`);
-console.log(`✨ Loaded ${UPSTREAM.MODELS.length} models`);
+console.log(`🧠 Thinking Support Enabled (Parsing 'reasoning-delta')`);
 
 // --- Handlers ---
 
@@ -163,21 +148,14 @@ async function handleChatCompletions(req) {
   const stream = body.stream === true;
   const messages = body.messages || [];
 
-  // --- FIX: Sanitize Messages & Prevent "substring" errors ---
+  // Sanitize Input
   const validMessages = messages
     .filter(m => m && m.role)
     .map(msg => {
         let contentStr = "";
-        if (typeof msg.content === 'string') {
-            contentStr = msg.content;
-        } else if (Array.isArray(msg.content)) {
-            contentStr = msg.content
-                .filter(p => p.type === 'text')
-                .map(p => p.text)
-                .join('\n');
-        } else if (msg.content) {
-            contentStr = String(msg.content);
-        }
+        if (typeof msg.content === 'string') contentStr = msg.content;
+        else if (Array.isArray(msg.content)) contentStr = msg.content.filter(p => p.type === 'text').map(p => p.text).join('\n');
+        else if (msg.content) contentStr = String(msg.content);
         
         return {
             parts: [{ type: "text", text: contentStr }],
@@ -186,11 +164,8 @@ async function handleChatCompletions(req) {
         };
     });
 
-  if (validMessages.length === 0) {
-     throw new Error("No valid messages provided.");
-  }
+  if (validMessages.length === 0) throw new Error("No valid messages provided.");
 
-  // Construct Upstream Payload
   const payload = {
     model: model,
     webSearch: false,
@@ -199,12 +174,24 @@ async function handleChatCompletions(req) {
     trigger: "submit-message"
   };
 
-  // Call Upstream
-  const upstreamRes = await fetch(UPSTREAM.API_URL, {
-    method: "POST",
-    headers: getUpstreamHeaders(), // Inject Fake IP
-    body: JSON.stringify(payload)
-  });
+  // Setup Timeout Controller
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), TIMEOUT_MS);
+
+  let upstreamRes;
+  try {
+      upstreamRes = await fetch(UPSTREAM.API_URL, {
+        method: "POST",
+        headers: getUpstreamHeaders(),
+        body: JSON.stringify(payload),
+        signal: controller.signal
+      });
+  } catch (err) {
+      clearTimeout(timeoutId);
+      throw new Error(err.name === 'AbortError' ? 'Upstream Timeout (Thinking took too long)' : err.message);
+  } finally {
+      clearTimeout(timeoutId);
+  }
 
   if (!upstreamRes.ok) {
     const errText = await upstreamRes.text();
@@ -213,6 +200,19 @@ async function handleChatCompletions(req) {
 
   const requestId = `chatcmpl-${generateRandomId()}`;
   const created = Math.floor(Date.now() / 1000);
+
+  // --- Parser Logic based on User Logs ---
+  const parseUpstreamChunk = (data) => {
+    // 1. Thinking Process
+    if (data.type === 'reasoning-delta' && data.delta) {
+        return { type: 'reasoning', content: data.delta };
+    }
+    // 2. Final Answer
+    if (data.type === 'text-delta' && data.delta) {
+        return { type: 'content', content: data.delta };
+    }
+    return null;
+  };
 
   // --- Stream Handler ---
   if (stream) {
@@ -240,17 +240,25 @@ async function handleChatCompletions(req) {
 
                             try {
                                 const data = JSON.parse(dataStr);
-                                if (data.type === 'text-delta' && data.delta) {
+                                const parsed = parseUpstreamChunk(data);
+                                
+                                if (parsed) {
+                                    const chunkDelta = {};
+                                    if (parsed.type === 'content') chunkDelta.content = parsed.content;
+                                    if (parsed.type === 'reasoning') chunkDelta.reasoning_content = parsed.content;
+
+                                    if (Object.keys(chunkDelta).length === 0) continue;
+
                                     const chunk = {
                                         id: requestId,
                                         object: "chat.completion.chunk",
                                         created: created,
                                         model: model,
-                                        choices: [{ index: 0, delta: { content: data.delta }, finish_reason: null }]
+                                        choices: [{ index: 0, delta: chunkDelta, finish_reason: null }]
                                     };
                                     controller.enqueue(encoder.encode(`data: ${JSON.stringify(chunk)}\n\n`));
                                 }
-                            } catch (e) { /* ignore parse errors */ }
+                            } catch (e) { }
                         }
                     }
                 }
@@ -265,9 +273,7 @@ async function handleChatCompletions(req) {
                 controller.enqueue(encoder.encode(`data: ${JSON.stringify(endChunk)}\n\n`));
                 controller.enqueue(encoder.encode('data: [DONE]\n\n'));
             } catch (err) {
-                const errChunk = {
-                    error: { message: err.message, type: "stream_error" }
-                };
+                const errChunk = { error: { message: err.message, type: "stream_error" } };
                 controller.enqueue(encoder.encode(`data: ${JSON.stringify(errChunk)}\n\n`));
             } finally {
                 controller.close();
@@ -285,6 +291,7 @@ async function handleChatCompletions(req) {
     const reader = upstreamRes.body.getReader();
     const decoder = new TextDecoder();
     let fullText = "";
+    let fullReasoning = "";
     let buffer = "";
 
     while (true) {
@@ -301,12 +308,20 @@ async function handleChatCompletions(req) {
             if (!dataStr || dataStr === '[DONE]') continue;
             try {
                 const data = JSON.parse(dataStr);
-                if (data.type === 'text-delta' && data.delta) {
-                    fullText += data.delta;
+                const parsed = parseUpstreamChunk(data);
+                if (parsed) {
+                    if (parsed.type === 'content') fullText += parsed.content;
+                    if (parsed.type === 'reasoning') fullReasoning += parsed.content;
                 }
             } catch (e) {}
         }
       }
+    }
+
+    // Wrap reasoning in <think> for non-stream clients
+    let finalContent = fullText;
+    if (fullReasoning) {
+        finalContent = `<think>\n${fullReasoning}\n</think>\n\n${fullText}`;
     }
 
     const response = {
@@ -316,7 +331,11 @@ async function handleChatCompletions(req) {
       model: model,
       choices: [{
         index: 0,
-        message: { role: "assistant", content: fullText },
+        message: { 
+            role: "assistant", 
+            content: finalContent,
+            reasoning_content: fullReasoning 
+        },
         finish_reason: "stop"
       }],
       usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 }
